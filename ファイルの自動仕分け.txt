@@ -1,0 +1,385 @@
+Option Explicit
+
+'【動作】
+'1. このマクロを保存したExcelファイルと同じフォルダーを処理対象とする。
+'2. アクティブシートのB2以降を上から読み込む。
+'3. B列の文字列と同名のフォルダーを作成する。
+'4. 同じ階層にあるファイル名にB列の文字列が含まれる場合、対応フォルダーへ移動する。
+'5. 複数の文字列に一致するファイルは、B列で最も上にある文字列を優先する。
+'6. このExcelファイル自身と、Excelの一時ファイル「~$～」は移動しない。
+'7. 移動先に同名ファイルがある場合は、「ファイル名 (1).拡張子」のように改名する。
+
+Public Sub B列の優先順位でファイルを振り分ける()
+
+    Dim ws As Worksheet
+    Dim fso As Object
+    Dim keywordDictionary As Object
+    Dim keywords As Collection
+    Dim sourceFiles As Collection
+
+    Dim basePath As String
+    Dim selfPath As String
+    Dim lastRow As Long
+    Dim rowNumber As Long
+    Dim fileIndex As Long
+
+    Dim keyword As String
+    Dim folderPath As String
+    Dim sourcePath As String
+    Dim sourceFileName As String
+    Dim validationError As String
+    Dim invalidList As String
+    Dim moveError As String
+    Dim errorList As String
+
+    Dim keywordItem As Variant
+    Dim fileItem As Object
+
+    Dim createdFolderCount As Long
+    Dim movedFileCount As Long
+    Dim failedFileCount As Long
+    Dim targetFileCount As Long
+
+    On Error GoTo FatalError
+
+    If Len(ThisWorkbook.Path) = 0 Then
+        MsgBox "このExcelファイルが保存されていないため、処理対象のフォルダーを特定できない。" & vbCrLf & _
+               "先にExcelファイルを保存してから実行すること。", _
+               vbExclamation, "処理中止"
+        Exit Sub
+    End If
+
+    If TypeName(ThisWorkbook.ActiveSheet) = "Worksheet" Then
+        Set ws = ThisWorkbook.ActiveSheet
+    Else
+        Set ws = ThisWorkbook.Worksheets(1)
+    End If
+
+    basePath = ThisWorkbook.Path
+    selfPath = ThisWorkbook.FullName
+
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    Set keywordDictionary = CreateObject("Scripting.Dictionary")
+    keywordDictionary.CompareMode = vbTextCompare
+
+    Set keywords = New Collection
+    Set sourceFiles = New Collection
+
+    lastRow = ws.Cells(ws.Rows.Count, 2).End(xlUp).Row
+
+    If lastRow < 2 Then
+        MsgBox "B2以降にフォルダー名・分類キーワードが入力されていない。", _
+               vbExclamation, "処理中止"
+        Exit Sub
+    End If
+
+    'B列のキーワードを上から順に取得する。
+    For rowNumber = 2 To lastRow
+
+        If Not IsError(ws.Cells(rowNumber, 2).Value2) Then
+
+            keyword = Trim$(CStr(ws.Cells(rowNumber, 2).Value2))
+
+            If Len(keyword) > 0 Then
+
+                validationError = GetFolderNameValidationError(keyword)
+
+                If Len(validationError) > 0 Then
+                    invalidList = invalidList & _
+                                  "B" & rowNumber & "「" & keyword & "」：" & _
+                                  validationError & vbCrLf
+
+                ElseIf fso.FileExists(fso.BuildPath(basePath, keyword)) Then
+                    invalidList = invalidList & _
+                                  "B" & rowNumber & "「" & keyword & "」：" & _
+                                  "同じ名前のファイルが既に存在するため、フォルダーを作成できない。" & _
+                                  vbCrLf
+
+                ElseIf Not keywordDictionary.Exists(keyword) Then
+                    keywordDictionary.Add keyword, True
+                    keywords.Add keyword
+                End If
+
+            End If
+        End If
+
+    Next rowNumber
+
+    If Len(invalidList) > 0 Then
+        MsgBox "次のB列の値はフォルダー名として使用できない。" & vbCrLf & vbCrLf & _
+               invalidList, vbCritical, "処理中止"
+        Exit Sub
+    End If
+
+    If keywords.Count = 0 Then
+        MsgBox "B2以降に有効なフォルダー名・分類キーワードが入力されていない。", _
+               vbExclamation, "処理中止"
+        Exit Sub
+    End If
+
+    '移動開始前に、同じ階層のファイルを一覧として保持する。
+    '処理中にファイルが移動しても、列挙順序が崩れないようにする。
+    For Each fileItem In fso.GetFolder(basePath).Files
+
+        If StrComp(fileItem.Path, selfPath, vbTextCompare) <> 0 Then
+
+            If Left$(fileItem.Name, 2) <> "~$" Then
+                sourceFiles.Add fileItem.Path
+            End If
+
+        End If
+
+    Next fileItem
+
+    targetFileCount = sourceFiles.Count
+
+    If MsgBox( _
+        "次の条件でファイルを振り分ける。" & vbCrLf & vbCrLf & _
+        "対象フォルダー：" & basePath & vbCrLf & _
+        "分類キーワード数：" & keywords.Count & vbCrLf & _
+        "同じ階層の対象ファイル数：" & targetFileCount & vbCrLf & vbCrLf & _
+        "B列の上の行から順に、ファイル名の部分一致で移動する。" & vbCrLf & _
+        "処理を開始するか。", _
+        vbQuestion + vbYesNo + vbDefaultButton2, _
+        "ファイル振り分けの確認") <> vbYes Then
+
+        Exit Sub
+
+    End If
+
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+
+    '必要なフォルダーを作成する。
+    For Each keywordItem In keywords
+
+        keyword = CStr(keywordItem)
+        folderPath = fso.BuildPath(basePath, keyword)
+
+        If Not fso.FolderExists(folderPath) Then
+            fso.CreateFolder folderPath
+            createdFolderCount = createdFolderCount + 1
+        End If
+
+    Next keywordItem
+
+    'B列の上から順に処理する。
+    '先に一致したキーワードへ移動されたファイルは、後続キーワードでは処理されない。
+    For Each keywordItem In keywords
+
+        keyword = CStr(keywordItem)
+        folderPath = fso.BuildPath(basePath, keyword)
+
+        For fileIndex = 1 To sourceFiles.Count
+
+            sourcePath = CStr(sourceFiles(fileIndex))
+
+            'すでに上位キーワードのフォルダーへ移動されたファイルは存在しない。
+            If fso.FileExists(sourcePath) Then
+
+                sourceFileName = fso.GetFileName(sourcePath)
+
+                If InStr(1, sourceFileName, keyword, vbTextCompare) > 0 Then
+
+                    moveError = vbNullString
+
+                    If MoveFileWithoutOverwrite( _
+                        fso:=fso, _
+                        sourcePath:=sourcePath, _
+                        destinationFolder:=folderPath, _
+                        errorMessage:=moveError) Then
+
+                        movedFileCount = movedFileCount + 1
+
+                    Else
+                        failedFileCount = failedFileCount + 1
+
+                        If failedFileCount <= 20 Then
+                            errorList = errorList & _
+                                        sourceFileName & "：" & _
+                                        moveError & vbCrLf
+                        End If
+
+                    End If
+
+                End If
+
+            End If
+
+        Next fileIndex
+
+    Next keywordItem
+
+CleanExit:
+
+    Application.ScreenUpdating = True
+    Application.EnableEvents = True
+
+    If failedFileCount = 0 Then
+
+        MsgBox "ファイルの振り分けが完了した。" & vbCrLf & vbCrLf & _
+               "新規作成フォルダー数：" & createdFolderCount & vbCrLf & _
+               "移動ファイル数：" & movedFileCount, _
+               vbInformation, "処理完了"
+
+    Else
+
+        If failedFileCount > 20 Then
+            errorList = errorList & _
+                        "ほか " & failedFileCount - 20 & " 件" & vbCrLf
+        End If
+
+        MsgBox "ファイルの振り分けが完了したが、移動できなかったファイルがある。" & _
+               vbCrLf & vbCrLf & _
+               "新規作成フォルダー数：" & createdFolderCount & vbCrLf & _
+               "移動ファイル数：" & movedFileCount & vbCrLf & _
+               "移動失敗数：" & failedFileCount & vbCrLf & vbCrLf & _
+               errorList, _
+               vbExclamation, "処理完了"
+
+    End If
+
+    Exit Sub
+
+FatalError:
+
+    Application.ScreenUpdating = True
+    Application.EnableEvents = True
+
+    MsgBox "処理中にエラーが発生した。" & vbCrLf & vbCrLf & _
+           "エラー番号：" & Err.Number & vbCrLf & _
+           "内容：" & Err.Description, _
+           vbCritical, "エラー"
+
+End Sub
+
+
+Private Function MoveFileWithoutOverwrite( _
+    ByVal fso As Object, _
+    ByVal sourcePath As String, _
+    ByVal destinationFolder As String, _
+    ByRef errorMessage As String) As Boolean
+
+    Dim destinationPath As String
+
+    On Error GoTo MoveError
+
+    destinationPath = GetUnusedDestinationPath( _
+        fso:=fso, _
+        destinationFolder:=destinationFolder, _
+        originalFileName:=fso.GetFileName(sourcePath))
+
+    fso.MoveFile sourcePath, destinationPath
+
+    MoveFileWithoutOverwrite = True
+    Exit Function
+
+MoveError:
+
+    errorMessage = Err.Description
+    MoveFileWithoutOverwrite = False
+    Err.Clear
+
+End Function
+
+
+Private Function GetUnusedDestinationPath( _
+    ByVal fso As Object, _
+    ByVal destinationFolder As String, _
+    ByVal originalFileName As String) As String
+
+    Dim candidatePath As String
+    Dim baseName As String
+    Dim extensionName As String
+    Dim extensionPart As String
+    Dim serialNumber As Long
+
+    candidatePath = fso.BuildPath(destinationFolder, originalFileName)
+
+    If Not fso.FileExists(candidatePath) Then
+        GetUnusedDestinationPath = candidatePath
+        Exit Function
+    End If
+
+    baseName = fso.GetBaseName(originalFileName)
+    extensionName = fso.GetExtensionName(originalFileName)
+
+    If Len(extensionName) > 0 Then
+        extensionPart = "." & extensionName
+    Else
+        extensionPart = vbNullString
+    End If
+
+    serialNumber = 1
+
+    Do
+        candidatePath = fso.BuildPath( _
+            destinationFolder, _
+            baseName & " (" & serialNumber & ")" & extensionPart)
+
+        serialNumber = serialNumber + 1
+    Loop While fso.FileExists(candidatePath)
+
+    GetUnusedDestinationPath = candidatePath
+
+End Function
+
+
+Private Function GetFolderNameValidationError( _
+    ByVal folderName As String) As String
+
+    Dim invalidCharacters As Variant
+    Dim characterItem As Variant
+    Dim reservedName As String
+
+    If Len(folderName) = 0 Then
+        GetFolderNameValidationError = "空欄である。"
+        Exit Function
+    End If
+
+    If Len(folderName) > 255 Then
+        GetFolderNameValidationError = "255文字を超えている。"
+        Exit Function
+    End If
+
+    If folderName = "." Or folderName = ".." Then
+        GetFolderNameValidationError = "フォルダー名として使用できない文字列である。"
+        Exit Function
+    End If
+
+    invalidCharacters = Array("\", "/", ":", "*", "?", """", "<", ">", "|")
+
+    For Each characterItem In invalidCharacters
+
+        If InStr(1, folderName, CStr(characterItem), vbBinaryCompare) > 0 Then
+            GetFolderNameValidationError = _
+                "使用禁止文字「" & CStr(characterItem) & "」が含まれている。"
+            Exit Function
+        End If
+
+    Next characterItem
+
+    If Right$(folderName, 1) = "." Or Right$(folderName, 1) = " " Then
+        GetFolderNameValidationError = _
+            "末尾にピリオドまたは空白が含まれている。"
+        Exit Function
+    End If
+
+    reservedName = UCase$(Split(folderName, ".")(0))
+
+    Select Case reservedName
+        Case "CON", "PRN", "AUX", "NUL"
+            GetFolderNameValidationError = _
+                "Windowsの予約名である。"
+            Exit Function
+    End Select
+
+    If reservedName Like "COM#" Or reservedName Like "LPT#" Then
+        GetFolderNameValidationError = _
+            "Windowsの予約名である。"
+        Exit Function
+    End If
+
+    GetFolderNameValidationError = vbNullString
+
+End Function
